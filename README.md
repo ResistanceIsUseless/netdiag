@@ -1,19 +1,24 @@
 # netdiag
 
-Single-file Go tool to detect **ISP DNS rate limiting** and **CDN blacklisting** (Akamai, Cloudflare, Fastly, AWS CloudFront) affecting a home network.
+Single-file Go tool to detect **ISP DNS rate limiting**, **CDN blacklisting** (Akamai, Cloudflare, Fastly, AWS CloudFront), and **network latency issues** affecting a home network.
 
 Standard library only — no dependencies.
 
-## Build & run
-
-On macOS (Apple Silicon or Intel):
+## Install
 
 ```bash
-go build -o netdiag netdiag.go
-./netdiag
+go install github.com/ResistanceIsUseless/netdiag@latest
 ```
 
-Or run directly without building:
+Or clone and build:
+
+```bash
+git clone https://github.com/ResistanceIsUseless/netdiag.git
+cd netdiag
+go build -o netdiag .
+```
+
+Or run directly without installing:
 
 ```bash
 go run netdiag.go
@@ -21,39 +26,66 @@ go run netdiag.go
 
 If you don't have Go installed: `brew install go`.
 
+## Usage
+
+```bash
+netdiag                   # run all checks (DNS + CDN + latency)
+netdiag -dns-only         # DNS rate-limit test only
+netdiag -cdn-only         # CDN blacklist probes only
+netdiag -latency-only     # TCP connect latency only
+netdiag -burst 100        # override DNS burst size
+netdiag -verbose          # show per-query details
+```
+
 ## Flags
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `-dns-only` | false | Skip CDN probes, run DNS rate-limit test only |
-| `-cdn-only` | false | Skip DNS burst, run CDN probes only |
+| `-dns-only` | false | Run DNS rate-limit test only |
+| `-cdn-only` | false | Run CDN blacklist probes only |
+| `-latency-only` | false | Run TCP connect latency test only |
 | `-burst N` | 50 | DNS queries per resolver in the burst test |
 | `-timeout D` | 5s | Per-request timeout (e.g. `-timeout 10s`) |
-| `-verbose` | false | Print every DNS query and CDN probe individually |
+| `-verbose` | false | Print every query/probe individually |
 
-## What it actually detects
+## What it detects
 
 ### DNS rate limiting
-Runs a burst of `-burst` DNS queries in parallel against four resolvers — your **system resolver** (read from `/etc/resolv.conf`) plus three public controls: **Cloudflare 1.1.1.1, Google 8.8.8.8, Quad9 9.9.9.9**.
 
-The heuristic flags your ISP resolver when **either**:
-- Failure rate is >5% absolute **and** >3× the median of the public controls, or
-- Average latency is >3× the median of the public controls (only when the control median is meaningful, >10ms).
+Bursts `-burst` DNS queries against your **system resolver** plus three public controls (Cloudflare 1.1.1.1, Google 8.8.8.8, Quad9 9.9.9.9). Flags your ISP resolver when:
 
-Both conditions require the public resolvers to be healthy — if everything fails, the tool reports that rather than a false positive.
+- Failure rate is >5% absolute **and** >3x the median of the public controls, or
+- Average latency is >3x the median of the public controls (when control median >10ms)
 
 ### CDN blacklisting
-Issues one `GET` per CDN target with a realistic browser User-Agent (default Go UA triggers too many bot challenges). Flags:
 
-- **403 Forbidden** — strongest signal of reputation block
+Issues `GET` requests to sites fronted by major CDNs with a realistic browser User-Agent. Flags:
+
+- **403 Forbidden** — strongest signal of IP reputation block
 - **429 Too Many Requests** — rate limited at edge
-- **TCP reset on connection** — hard block at network layer
-- **TLS handshake failure** — less common but happens with some WAFs
-- **Challenge/block page signatures** in the response body (`"access denied"`, Cloudflare `cf-error-details`, Akamai reference IDs, etc.)
+- **TCP reset** — hard block at network layer
+- **TLS handshake failure** — WAF-level block
+- **Challenge/block page signatures** in response body (Cloudflare `cf-error-details`, Akamai reference IDs, `"access denied"`, etc.)
 
-Also fetches your egress IP from `1.1.1.1/cdn-cgi/trace` so you can check it against third-party blacklist databases (Spamhaus, AbuseIPDB, Project Honeypot).
+Probed targets:
+- **Akamai**: British Airways, IBM
+- **Cloudflare**: cloudflare.com, Discord, Coinbase
+- **Fastly**: fastly.com
+- **AWS CloudFront**: aws.amazon.com
+- **Google**: google.com
 
-## Sample output structure
+Also reports your egress IP (via `1.1.1.1/cdn-cgi/trace`) for manual blacklist lookups.
+
+### TCP connect latency
+
+Measures raw TCP handshake time (SYN -> SYN-ACK) to endpoints across multiple regions with 5 samples each. Reports min/avg/max/jitter and flags targets with jitter >50ms.
+
+Targets:
+- **Anycast**: Cloudflare (1.1.1.1), Google (8.8.8.8)
+- **AWS regions**: us-east-1, eu-west-1, ap-southeast-1
+- **Other**: Microsoft (Office 365), Akamai
+
+## Sample output
 
 ```
 netdiag - home network diagnostic
@@ -74,33 +106,55 @@ Google               8.8.8.8:53                   50        0       14ms      29
 Quad9                9.9.9.9:53                   50        0       18ms      41ms
 
 VERDICT: Your ISP resolver is behaving materially worse than public resolvers.
-         This is consistent with DNS rate limiting or resolver overload.
-         Workaround: configure 1.1.1.1 or 8.8.8.8 as your DNS server.
+
+[CDN] Blacklist / reputation probe
+------------------------------------------------------------
+Egress IP (as seen by internet): 203.0.113.42
+
+Target             Vendor       Status    Latency Notes
+------------------------------------------------------------------------------------------
+! Akamai (BA)       akamai          403      307ms 403 Forbidden (reputation block likely)
+Cloudflare        cloudflare      200      351ms
+...
+
+VERDICT: Akamai-fronted site returned a suspicious response.
+
+[LATENCY] TCP connect probe
+------------------------------------------------------------
+Samples per target: 5
+
+Target               Address                                  Min      Avg      Max   Jitter
+-----------------------------------------------------------------------------------------------
+Cloudflare           1.1.1.1:443                             10ms     12ms     16ms      6ms
+Google               8.8.8.8:443                              9ms     11ms     16ms      7ms
+AWS us-east-1        ec2.us-east-1.amazonaws.com:443         68ms     75ms     95ms     27ms
+...
+
+VERDICT: TCP connect latency looks stable across all targets.
 ```
 
-## Remediation guidance
+## Remediation
 
-**If DNS rate limiting is confirmed:**
-- Switch your router or devices to `1.1.1.1` / `8.8.8.8` / `9.9.9.9`
-- Consider DoH/DoT to prevent ISP-level inspection or meddling
+**DNS rate limiting:**
+- Switch to `1.1.1.1` / `8.8.8.8` / `9.9.9.9`
+- Consider DoH/DoT to prevent ISP inspection
 - For high-volume use, run a local recursive resolver (Unbound, Pi-hole)
 
-**If CDN blacklisting is detected:**
-- Your egress IP is printed at the top of the CDN section — feed it into `abuseipdb.com`, `spamhaus.org`, and the CDN's own lookup if available
-- Akamai: no public unblock portal — contact your ISP for a new IP assignment
-- Cloudflare: some blocks are origin-configured, not reputation; try other Cloudflare sites
-- If multiple CDNs flag the same IP, reputation issue is upstream (ISP or prior tenant)
-- Quick test: run the tool through a VPN — if all flags clear, it's IP-specific
+**CDN blacklisting:**
+- Check your egress IP at abuseipdb.com, spamhaus.org
+- Akamai: no public unblock portal — contact ISP for a new IP
+- Cloudflare: blocks are per-site (configured by site owner), not always global
+- Quick test: run through a VPN — if flags clear, it's IP-specific
 
-## Scope limitations (called out explicitly)
+**High latency/jitter:**
+- Compare VPN vs direct to isolate ISP vs last-mile issues
+- Check for bufferbloat with a speed test under load
+- Jitter >50ms typically indicates congestion or unstable routing
 
-- **macOS resolver detection** uses `scutil --dns` (the correct source on macOS — `/etc/resolv.conf` is often stale there). Requires `scutil` to be on PATH, which it is by default on every macOS install.
-- **Windows resolver detection is a stub.** Code falls back to `127.0.0.53:53` and still runs public-resolver comparisons, but won't identify the actual Windows-configured resolver. Adding this would require `netsh` shell-out or the IP Helper API.
-- **No IPv6-specific path.** Probes use whatever the OS picks. If you want explicit v4 vs v6 comparison, that's a future extension.
-- **Not a blacklist checker.** The tool tells you *whether* you're being treated as blocked by a given CDN — it does not query RBLs directly. The egress IP is printed so you can do that lookup yourself.
-- **Polite burst size.** Default 50 queries is low enough that public resolvers won't flag you as abusive. If you want to be more aggressive, `-burst 500` is fine against your own ISP but not recommended against the public controls.
+## Limitations
 
-## Files
-
-- `netdiag.go` — the entire tool, single file
-- `README.md` — this document
+- **macOS resolver detection** uses `scutil --dns` (correct source — `/etc/resolv.conf` is often stale on macOS)
+- **Windows resolver detection is a stub** — falls back to `127.0.0.53:53`
+- **No IPv6-specific path** — probes use whatever the OS picks
+- **Not a blacklist database checker** — detects CDN-level blocks, prints your IP for manual RBL lookups
+- **Polite burst size** — default 50 queries won't trigger abuse flags on public resolvers
